@@ -6,7 +6,7 @@
  */
 import { ref, watchPostEffect } from 'vue';
 import type { Point } from '../lib/geometry';
-import type { Stage } from '../lib/session';
+import type { CrackRecord, Stage } from '../lib/session';
 import { drawOverlay } from '../lib/overlay';
 
 const props = defineProps<{
@@ -14,6 +14,7 @@ const props = defineProps<{
   stage: Stage;
   scalePoints: readonly Point[];
   crackPoints: readonly Point[];
+  records: readonly CrackRecord[];
 }>();
 
 const emit = defineEmits<{
@@ -62,6 +63,7 @@ watchPostEffect(() => {
     stage: props.stage,
     scalePoints: props.scalePoints,
     crackPoints: props.crackPoints,
+    records: props.records,
     hover: hover.value,
   });
 });

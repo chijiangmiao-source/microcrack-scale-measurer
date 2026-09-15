@@ -17,6 +17,16 @@ async function calibrateAndMeasure(page: Page): Promise<void> {
   await expect(page.getByTestId('result-value')).toHaveText('5.000 mm');
 }
 
+/** 读取叠加层画布某一自然像素的 RGBA（叠加层无外部图片，不会被跨域污染）。 */
+async function overlayPixel(page: Page, x: number, y: number): Promise<[number, number, number, number]> {
+  return page.getByTestId('overlay-canvas').evaluate((el, [px, py]) => {
+    const canvas = el as HTMLCanvasElement;
+    const ctx = canvas.getContext('2d')!;
+    const d = ctx.getImageData(px, py, 1, 1).data;
+    return [d[0], d[1], d[2], d[3]];
+  }, [x, y]);
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
 });
@@ -200,4 +210,135 @@ test('标尺长度越界：停留在标定阶段，改正后可继续', async ({
   await page.getByTestId('confirm-length').click();
   await expect(page.getByTestId('stage-prompt')).toContainText('点取裂纹起点');
   await expect(page.getByTestId('error-message')).toHaveCount(0);
+});
+
+test('同一张图连续测量：记录后复用比例，结果面板按顺序展示并突出当前条', async ({ page }) => {
+  await page.getByTestId('file-input').setInputFiles(fixtures.small);
+  const overlay = page.getByTestId('overlay-canvas');
+  await overlay.click({ position: { x: 50, y: 50 } });
+  await overlay.click({ position: { x: 250, y: 50 } });
+  await page.getByTestId('length-input').fill('10');
+  await page.getByTestId('confirm-length').click();
+
+  // 第 1 条：100 px → 5.000 mm
+  await overlay.click({ position: { x: 10, y: 200 } });
+  await overlay.click({ position: { x: 110, y: 200 } });
+  await expect(page.getByTestId('result-value')).toHaveText('5.000 mm');
+  const currentRow = page.getByTestId('current-row');
+  await expect(currentRow).toHaveAttribute('data-index', '1');
+
+  await page.getByTestId('record-next').click();
+  await expect(page.getByTestId('stage-prompt')).toContainText('第 2 条裂纹');
+  // 已记录一条进入只读列表，当前结果区收起，比例无需重新标定
+  await expect(page.getByTestId('record-list')).toBeVisible();
+  const rows1 = page.getByTestId('record-row');
+  await expect(rows1).toHaveCount(1);
+  await expect(rows1.first()).toHaveAttribute('data-index', '1');
+  await expect(rows1.first().getByTestId('record-length')).toHaveText('5.000 mm');
+  await expect(page.getByTestId('result-value')).toHaveCount(0);
+  await expect(page.getByTestId('ratio-value')).toContainText('0.05 mm/px');
+
+  // 已记录线段仍在画布上（品红记录色，中点像素 (60,200)）
+  let pixel = await overlayPixel(page, 60, 200);
+  expect(pixel[0]).toBe(244);
+  expect(pixel[1]).toBe(114);
+  expect(pixel[2]).toBe(182);
+
+  // 第 2 条：200 px → 10.000 mm（比例继续复用）
+  await overlay.click({ position: { x: 10, y: 100 } });
+  await overlay.click({ position: { x: 210, y: 100 } });
+  await expect(page.getByTestId('result-value')).toHaveText('10.000 mm');
+  await expect(page.getByTestId('current-row')).toHaveAttribute('data-index', '2');
+
+  await page.getByTestId('record-next').click();
+  const rows2 = page.getByTestId('record-row');
+  await expect(rows2).toHaveCount(2);
+  await expect(rows2.nth(0).getByTestId('record-length')).toHaveText('5.000 mm');
+  await expect(rows2.nth(1).getByTestId('record-length')).toHaveText('10.000 mm');
+  await expect(page.getByTestId('stage-prompt')).toContainText('第 3 条裂纹');
+
+  // 两条已记录线段都保留在画布上
+  pixel = await overlayPixel(page, 60, 200);
+  expect(pixel[0]).toBe(244);
+  const pixel2 = await overlayPixel(page, 110, 100);
+  expect(pixel2[0]).toBe(244);
+});
+
+test('重复端点（含反向点取）停留测量阶段，改点后顺利得到新结果', async ({ page }) => {
+  await page.getByTestId('file-input').setInputFiles(fixtures.small);
+  const overlay = page.getByTestId('overlay-canvas');
+  await overlay.click({ position: { x: 50, y: 50 } });
+  await overlay.click({ position: { x: 250, y: 50 } });
+  await page.getByTestId('length-input').fill('10');
+  await page.getByTestId('confirm-length').click();
+  await overlay.click({ position: { x: 10, y: 200 } });
+  await overlay.click({ position: { x: 110, y: 200 } });
+  await page.getByTestId('record-next').click();
+
+  // 正向重复：停留测量阶段并提示
+  await overlay.click({ position: { x: 10, y: 200 } });
+  await overlay.click({ position: { x: 110, y: 200 } });
+  await expect(page.getByTestId('error-message')).toContainText('两个端点完全相同');
+  await expect(page.getByTestId('stage-prompt')).toContainText('测量阶段');
+  await expect(page.getByTestId('result-value')).toHaveCount(0);
+  await expect(page.getByTestId('record-row')).toHaveCount(1);
+  await expect(page.getByTestId('ratio-value')).toContainText('0.05 mm/px');
+
+  // 反向点取同样判重，已有记录不变
+  await overlay.click({ position: { x: 110, y: 200 } });
+  await overlay.click({ position: { x: 10, y: 200 } });
+  await expect(page.getByTestId('error-message')).toContainText('两个端点完全相同');
+  await expect(page.getByTestId('record-row')).toHaveCount(1);
+  await expect(page.getByTestId('stage-prompt')).toContainText('点取裂纹起点');
+
+  // 改点后顺利得到新结果：100 px 竖向 → 5.000 mm
+  await overlay.click({ position: { x: 300, y: 100 } });
+  await expect(page.getByTestId('stage-prompt')).toContainText('点取裂纹终点');
+  await overlay.click({ position: { x: 300, y: 200 } });
+  await expect(page.getByTestId('result-value')).toHaveText('5.000 mm');
+  await expect(page.getByTestId('error-message')).toHaveCount(0);
+  await page.getByTestId('record-next').click();
+  await expect(page.getByTestId('record-row')).toHaveCount(2);
+});
+
+test('重新测量只弃当前一条；重新标定与换入有效新图清空整批，无效文件保留整批', async ({ page }) => {
+  await page.getByTestId('file-input').setInputFiles(fixtures.small);
+  const overlay = page.getByTestId('overlay-canvas');
+  await overlay.click({ position: { x: 50, y: 50 } });
+  await overlay.click({ position: { x: 250, y: 50 } });
+  await page.getByTestId('length-input').fill('10');
+  await page.getByTestId('confirm-length').click();
+  await overlay.click({ position: { x: 10, y: 200 } });
+  await overlay.click({ position: { x: 110, y: 200 } });
+  await page.getByTestId('record-next').click();
+  await expect(page.getByTestId('record-row')).toHaveCount(1);
+
+  // 第 2 条只点了起点就放弃：只清未记录的一条
+  await overlay.click({ position: { x: 1, y: 1 } });
+  await page.getByTestId('restart-measurement').click();
+  await expect(page.getByTestId('stage-prompt')).toContainText('第 2 条裂纹');
+  await expect(page.getByTestId('stage-prompt')).toContainText('点取裂纹起点');
+  await expect(page.getByTestId('record-row')).toHaveCount(1);
+  await expect(page.getByTestId('ratio-value')).toContainText('0.05 mm/px');
+
+  // 已选齐两点（完成阶段）但未记录时放弃，同样只弃当前一条
+  await overlay.click({ position: { x: 10, y: 100 } });
+  await overlay.click({ position: { x: 210, y: 100 } });
+  await expect(page.getByTestId('result-value')).toHaveText('10.000 mm');
+  await page.getByTestId('restart-current').click();
+  await expect(page.getByTestId('result-value')).toHaveCount(0);
+  await expect(page.getByTestId('record-row')).toHaveCount(1);
+
+  // 无效文件：图片、比例与整批记录全部保留
+  await page.getByTestId('file-input').setInputFiles(fixtures.corrupt);
+  await expect(page.getByTestId('error-message')).toContainText('已损坏或无法解码');
+  await expect(page.getByTestId('overlay-canvas')).toHaveAttribute('width', '400');
+  await expect(page.getByTestId('ratio-value')).toContainText('0.05 mm/px');
+  await expect(page.getByTestId('record-row')).toHaveCount(1);
+
+  // 重新标定：清空整批记录，回到标定阶段
+  await page.getByTestId('restart-calibration').click();
+  await expect(page.getByTestId('stage-prompt')).toContainText('标定阶段');
+  await expect(page.getByTestId('record-list')).toHaveCount(0);
+  await expect(page.getByTestId('ratio-value')).toHaveCount(0);
 });

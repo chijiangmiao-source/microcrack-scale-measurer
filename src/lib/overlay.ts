@@ -4,18 +4,21 @@
  */
 
 import type { Point } from './geometry';
-import type { Stage } from './session';
+import type { CrackRecord, Stage } from './session';
 
 export interface OverlayModel {
   stage: Stage;
   scalePoints: readonly Point[];
   crackPoints: readonly Point[];
+  /** 已记录裂纹（含端点与顺序号），连续测量期间常驻画布。 */
+  records: readonly CrackRecord[];
   /** 鼠标悬停位置（自然像素），用于拾取阶段的十字线。 */
   hover: Point | null;
 }
 
 const SCALE_COLOR = '#22d3ee'; // 标尺：青
-const CRACK_COLOR = '#fb7185'; // 裂纹：红
+const CRACK_COLOR = '#fb7185'; // 当前裂纹：红
+const RECORD_COLOR = '#f472b6'; // 已记录裂纹：品红
 const OUTLINE_COLOR = 'rgba(15, 23, 42, 0.9)';
 const CROSSHAIR_COLOR = 'rgba(255, 255, 255, 0.45)';
 const POINT_RADIUS = 5;
@@ -91,6 +94,7 @@ function midpoint(a: Point, b: Point): Point {
 
 /**
  * 重绘整个叠加层。
+ * 已记录裂纹（records）在测量 / 完成阶段常驻画布并标注顺序号；
  * 完成阶段（done）只叠加当前测量线及其端点；标定/测量阶段叠加对应点位与线段。
  */
 export function drawOverlay(ctx: CanvasRenderingContext2D, model: OverlayModel): void {
@@ -112,11 +116,32 @@ export function drawOverlay(ctx: CanvasRenderingContext2D, model: OverlayModel):
     }
   }
 
+  // 已记录裂纹：连续测量期间常驻，顺序号标注在线段中点
+  if (model.stage === 'measuring' || model.stage === 'done') {
+    for (const record of model.records) {
+      drawSegment(ctx, record.start, record.end, RECORD_COLOR);
+      drawPoint(ctx, record.start, RECORD_COLOR);
+      drawPoint(ctx, record.end, RECORD_COLOR);
+      drawLabel(
+        ctx,
+        `裂纹 ${record.index}`,
+        midpoint(record.start, record.end),
+        RECORD_COLOR,
+      );
+    }
+  }
+
   if (model.crackPoints.length === 2) {
     drawSegment(ctx, model.crackPoints[0], model.crackPoints[1], CRACK_COLOR);
   }
   for (const p of model.crackPoints) drawPoint(ctx, p, CRACK_COLOR);
   if (model.crackPoints.length === 2) {
-    drawLabel(ctx, '裂纹', midpoint(model.crackPoints[0], model.crackPoints[1]), CRACK_COLOR);
+    // 当前一条的顺序号 = 已记录条数 + 1
+    drawLabel(
+      ctx,
+      `裂纹 ${model.records.length + 1}`,
+      midpoint(model.crackPoints[0], model.crackPoints[1]),
+      CRACK_COLOR,
+    );
   }
 }

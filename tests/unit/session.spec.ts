@@ -4,6 +4,7 @@ import {
   MIN_SCALE_LENGTH_MM,
   MeasurementSession,
   SESSION_ERRORS,
+  type CrackRecord,
 } from '../../src/lib/session';
 
 function calibratedSession(): MeasurementSession {
@@ -160,5 +161,196 @@ describe('状态保留与重置', () => {
     expect(s.ratioMmPerPx).toBeNull();
     expect(s.resultMm).toBeNull();
     expect(s.scalePoints).toHaveLength(0);
+  });
+});
+
+describe('同图连续测量多条裂纹', () => {
+  it('记录并测下一条：写入顺序记录、保留比例与点位、进入下一条选取', () => {
+    const s = calibratedSession(); // 0.05 mm/px
+
+    s.addCrackPoint({ x: 10, y: 200 });
+    s.addCrackPoint({ x: 110, y: 200 }); // 100 px → 5 mm
+    expect(s.stage).toBe('done');
+    expect(s.resultMm).toBe(5);
+
+    expect(s.recordAndContinue()).toBe(true);
+    expect(s.stage).toBe('measuring');
+    expect(s.crackPoints).toHaveLength(0);
+    expect(s.resultMm).toBeNull();
+    // 比例继续复用，无需重新标定
+    expect(s.ratioMmPerPx).toBe(0.05);
+    expect(s.records).toHaveLength(1);
+    expect(s.records[0]).toEqual({
+      index: 1,
+      start: { x: 10, y: 200 },
+      end: { x: 110, y: 200 },
+      resultMm: 5,
+    });
+  });
+
+  it('连续多条：继续测量复用原比例，记录按顺序排列且只读', () => {
+    const s = calibratedSession(); // 0.05 mm/px
+
+    // 第 1 条：100 px → 5 mm
+    s.addCrackPoint({ x: 10, y: 200 });
+    s.addCrackPoint({ x: 110, y: 200 });
+    s.recordAndContinue();
+
+    // 第 2 条：200 px → 10 mm（比例不变）
+    s.addCrackPoint({ x: 0, y: 0 });
+    s.addCrackPoint({ x: 200, y: 0 });
+    expect(s.stage).toBe('done');
+    expect(s.resultMm).toBe(10);
+    s.recordAndContinue();
+
+    // 第 3 条：50 px → 2.5 mm
+    s.addCrackPoint({ x: 300, y: 300 });
+    s.addCrackPoint({ x: 350, y: 300 });
+    expect(s.resultMm).toBe(2.5);
+
+    expect(s.records).toHaveLength(2);
+    expect(s.records.map((r) => [r.index, r.resultMm])).toEqual([
+      [1, 5],
+      [2, 10],
+    ]);
+
+    // 记录为只读视图：外部不得就地改写状态机内部数据
+    const frozen = s.records;
+    expect(() => {
+      (frozen as CrackRecord[]).push({
+        index: 99,
+        start: { x: 0, y: 0 },
+        end: { x: 1, y: 1 },
+        resultMm: 0,
+      });
+    }).toThrow();
+  });
+
+  it('recordAndContinue 仅在完成阶段可调用', () => {
+    const s = calibratedSession();
+    expect(s.recordAndContinue()).toBe(false); // measuring 且未选两点
+    s.addCrackPoint({ x: 0, y: 0 });
+    expect(s.recordAndContinue()).toBe(false); // 仅一点
+    expect(s.records).toHaveLength(0);
+  });
+
+  it('与已记录端点完全相同（含反向点取）：停留测量阶段并提示重复', () => {
+    const s = calibratedSession();
+    s.addCrackPoint({ x: 10, y: 200 });
+    s.addCrackPoint({ x: 110, y: 200 });
+    s.recordAndContinue();
+
+    // 正向重复
+    s.addCrackPoint({ x: 10, y: 200 });
+    s.addCrackPoint({ x: 110, y: 200 });
+    expect(s.stage).toBe('measuring');
+    expect(s.error).toBe(SESSION_ERRORS.CRACK_SEGMENT_DUPLICATE);
+    expect(s.crackPoints).toHaveLength(0); // 本条重来
+    expect(s.records).toHaveLength(1);
+    expect(s.ratioMmPerPx).toBe(0.05);
+
+    // 反向点取同样判重
+    s.addCrackPoint({ x: 110, y: 200 });
+    s.addCrackPoint({ x: 10, y: 200 });
+    expect(s.stage).toBe('measuring');
+    expect(s.error).toBe(SESSION_ERRORS.CRACK_SEGMENT_DUPLICATE);
+    expect(s.crackPoints).toHaveLength(0);
+    expect(s.records).toHaveLength(1);
+  });
+
+  it('判重后改点可顺利得到新结果，已有记录不变', () => {
+    const s = calibratedSession();
+    s.addCrackPoint({ x: 10, y: 200 });
+    s.addCrackPoint({ x: 110, y: 200 }); // 5 mm
+    s.recordAndContinue();
+
+    // 先触发重复
+    s.addCrackPoint({ x: 110, y: 200 });
+    s.addCrackPoint({ x: 10, y: 200 });
+    expect(s.stage).toBe('measuring');
+
+    // 改点后得到全新一条：100 px 竖向 → 5 mm
+    s.addCrackPoint({ x: 300, y: 100 });
+    expect(s.stage).toBe('measuring');
+    s.addCrackPoint({ x: 300, y: 200 });
+    expect(s.stage).toBe('done');
+    expect(s.resultMm).toBe(5);
+    expect(s.records).toHaveLength(1);
+    expect(s.records[0].resultMm).toBe(5);
+
+    s.recordAndContinue();
+    expect(s.records).toHaveLength(2);
+    expect(s.records[1].start).toEqual({ x: 300, y: 100 });
+    expect(s.records[1].end).toEqual({ x: 300, y: 200 });
+  });
+
+  it('重新测量只清除尚未记录的一条，已记录裂纹与比例保留', () => {
+    const s = calibratedSession();
+    s.addCrackPoint({ x: 0, y: 0 });
+    s.addCrackPoint({ x: 100, y: 0 }); // 5 mm
+    s.recordAndContinue();
+
+    // 第 2 条只点了起点就点重新测量
+    s.addCrackPoint({ x: 5, y: 5 });
+    expect(s.crackPoints).toHaveLength(1);
+    s.restartMeasurement();
+    expect(s.stage).toBe('measuring');
+    expect(s.crackPoints).toHaveLength(0);
+    expect(s.resultMm).toBeNull();
+    expect(s.records).toHaveLength(1);
+    expect(s.records[0].resultMm).toBe(5);
+    expect(s.ratioMmPerPx).toBe(0.05);
+
+    // 完成阶段（两点已选但未记录）重新测量同样只弃当前一条
+    s.addCrackPoint({ x: 0, y: 0 });
+    s.addCrackPoint({ x: 200, y: 0 });
+    expect(s.stage).toBe('done');
+    s.restartMeasurement();
+    expect(s.stage).toBe('measuring');
+    expect(s.crackPoints).toHaveLength(0);
+    expect(s.resultMm).toBeNull();
+    expect(s.records).toHaveLength(1);
+  });
+
+  it('重新标定清空整批记录', () => {
+    const s = calibratedSession();
+    s.addCrackPoint({ x: 0, y: 0 });
+    s.addCrackPoint({ x: 100, y: 0 });
+    s.recordAndContinue();
+    s.addCrackPoint({ x: 0, y: 0 });
+    s.addCrackPoint({ x: 200, y: 0 });
+    s.recordAndContinue();
+    expect(s.records).toHaveLength(2);
+
+    s.restartCalibration();
+    expect(s.stage).toBe('calibrating');
+    expect(s.records).toHaveLength(0);
+    expect(s.ratioMmPerPx).toBeNull();
+    expect(s.crackPoints).toHaveLength(0);
+  });
+
+  it('换入有效新图清空整批记录；文件错误保留整批记录与当前结果', () => {
+    const s = calibratedSession();
+    s.addCrackPoint({ x: 0, y: 0 });
+    s.addCrackPoint({ x: 100, y: 0 });
+    s.recordAndContinue();
+    s.addCrackPoint({ x: 0, y: 0 });
+    s.addCrackPoint({ x: 200, y: 0 });
+    expect(s.stage).toBe('done');
+    expect(s.resultMm).toBe(10);
+
+    // 无效文件：记录、比例、当前结果一律保留
+    s.reportFileError('图片已损坏或无法解码');
+    expect(s.records).toHaveLength(1);
+    expect(s.ratioMmPerPx).toBe(0.05);
+    expect(s.resultMm).toBe(10);
+    expect(s.stage).toBe('done');
+
+    // 换入有效新图：整批清空
+    s.beginWithImage();
+    expect(s.records).toHaveLength(0);
+    expect(s.resultMm).toBeNull();
+    expect(s.ratioMmPerPx).toBeNull();
+    expect(s.stage).toBe('calibrating');
   });
 });

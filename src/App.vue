@@ -20,6 +20,9 @@ const lengthInput = ref('');
 
 const hasImage = computed(() => image.value !== null);
 
+/** 当前正在测量的裂纹顺序号 = 已记录条数 + 1。 */
+const currentIndex = computed(() => session.records.length + 1);
+
 const stagePrompt = computed(() => {
   switch (session.stage) {
     case 'idle':
@@ -28,12 +31,14 @@ const stagePrompt = computed(() => {
       if (session.scalePoints.length === 0) return '标定阶段 · 第 1 步：点取标尺起点';
       if (session.scalePoints.length === 1) return '标定阶段 · 第 2 步：点取标尺终点';
       return `标定阶段 · 第 3 步：输入标尺实际长度（${MIN_SCALE_LENGTH_MM} – ${MAX_SCALE_LENGTH_MM} mm）并确认`;
-    case 'measuring':
+    case 'measuring': {
+      const which = `测量阶段 · 第 ${currentIndex.value} 条裂纹`;
       return session.crackPoints.length === 0
-        ? '测量阶段 · 第 1 步：点取裂纹起点'
-        : '测量阶段 · 第 2 步：点取裂纹终点';
+        ? `${which} · 第 1 步：点取裂纹起点`
+        : `${which} · 第 2 步：点取裂纹终点`;
+    }
     case 'done':
-      return '测量完成';
+      return `测量完成 · 第 ${currentIndex.value} 条裂纹，可记录并测下一条`;
   }
 });
 
@@ -58,11 +63,11 @@ async function onFileChange(event: Event): Promise<void> {
 
   const result = await loadImageFile(file);
   if (!result.ok) {
-    // 无效文件：仅提示，保留当前图片、标定与结果
+    // 无效文件：仅提示，保留当前图片、标定、整批记录与结果
     session.reportFileError(result.message);
     return;
   }
-  // 换入新的有效图片：清空旧状态
+  // 换入新的有效图片：清空旧状态（含整批记录）
   if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
   currentObjectUrl = result.objectUrl;
   image.value = result.image;
@@ -88,7 +93,13 @@ function restartCalibration(): void {
 }
 
 function restartMeasurement(): void {
+  // 只清除尚未记录的当前一条，已记录裂纹与比例保留
   session.restartMeasurement();
+}
+
+function recordAndContinue(): void {
+  // 写入顺序记录并进入下一条裂纹的两点选取，比例继续复用
+  session.recordAndContinue();
 }
 </script>
 
@@ -120,13 +131,13 @@ function restartMeasurement(): void {
           重新标定
         </button>
         <button
-          v-if="session.stage === 'measuring' || session.stage === 'done'"
+          v-if="session.stage === 'measuring'"
           type="button"
           class="button"
           data-testid="restart-measurement"
           @click="restartMeasurement"
         >
-          重新测量裂纹
+          重新测量本条
         </button>
       </div>
     </header>
@@ -148,6 +159,7 @@ function restartMeasurement(): void {
           :stage="session.stage"
           :scale-points="session.scalePoints"
           :crack-points="session.crackPoints"
+          :records="session.records"
           @pick="onPick"
         />
         <div v-else class="placeholder" data-testid="placeholder">
@@ -184,21 +196,115 @@ function restartMeasurement(): void {
           </button>
         </div>
 
-        <div v-if="session.stage === 'measuring'" class="panel-card">
+        <div
+          v-if="session.stage === 'measuring' || session.stage === 'done'"
+          class="panel-card"
+          data-testid="result-panel"
+        >
           <p class="panel-row">
             标尺比例：<span data-testid="ratio-value">{{ ratioText }}</span>
           </p>
-        </div>
 
-        <div v-if="session.stage === 'done'" class="panel-card" data-testid="result-panel">
-          <p class="panel-row">
-            标尺比例：<span data-testid="ratio-value">{{ ratioText }}</span>
+          <ul v-if="session.records.length > 0" class="record-list" data-testid="record-list">
+            <li
+              v-for="record in session.records"
+              :key="record.index"
+              class="record-row"
+              :data-index="record.index"
+              data-testid="record-row"
+            >
+              <span class="record-no">第 {{ record.index }} 条</span>
+              <span class="record-length" data-testid="record-length">
+                {{ formatMm(record.resultMm) }}
+              </span>
+            </li>
+          </ul>
+
+          <p
+            v-if="session.stage === 'done'"
+            class="panel-row panel-row--result record-row record-row--current"
+            :data-index="currentIndex"
+            data-testid="current-row"
+          >
+            <span class="record-no">第 {{ currentIndex }} 条</span>
+            <span class="record-length">裂纹长度：<span data-testid="result-value">{{ resultText }}</span></span>
           </p>
-          <p class="panel-row panel-row--result">
-            裂纹长度：<span data-testid="result-value">{{ resultText }}</span>
+
+          <div v-if="session.stage === 'done'" class="record-actions">
+            <button
+              type="button"
+              class="button button--primary"
+              data-testid="record-next"
+              @click="recordAndContinue"
+            >
+              记录并测下一条
+            </button>
+            <button
+              type="button"
+              class="button"
+              data-testid="restart-current"
+              @click="restartMeasurement"
+            >
+              重新测量本条
+            </button>
+          </div>
+
+          <p v-if="session.stage === 'measuring'" class="hint">
+            <template v-if="session.records.length > 0">
+              已记录 {{ session.records.length }} 条 · 正在测量第 {{ currentIndex }} 条
+            </template>
+            <template v-else>点取裂纹两端，比例标定只做一次。</template>
           </p>
         </div>
       </aside>
     </main>
   </div>
 </template>
+
+<style scoped>
+.record-list {
+  list-style: none;
+  margin: 10px 0;
+  padding: 0;
+  border-top: 1px solid var(--border);
+}
+
+.record-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+}
+
+.record-no {
+  color: var(--text-dim);
+}
+
+.record-row--current {
+  border: 1px solid #be123c;
+  border-radius: 6px;
+  background: #450a0a;
+  margin-top: 8px;
+  font-size: 16px;
+}
+
+.record-row--current .record-no {
+  color: #fda4af;
+  font-weight: 700;
+}
+
+.record-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.record-actions .button {
+  width: 100%;
+  margin-top: 0;
+}
+</style>
